@@ -59,9 +59,16 @@ static __global__ void mul_mat_vec_q(
     // Get the correct vector dot product function for our quantization type
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
-    // Original configuration - not optimized for specific GPU
-    constexpr int nwarps = ncols_y <= 4 ? 4 : 2;
-    constexpr int rows_per_cuda_block = ncols_y == 1 ? 1 : 2;
+    // Optimize based on device compute capability
+    const int device_id = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[device_id].cc;
+    
+    // RTX 4090 (Ada Lovelace) has cc 8.9, A4000 (Ampere) has cc 8.6
+    const int nwarps = (cc >= 89) ? (ncols_y <= 4 ? 8 : 4) :  // RTX 4090
+                                   (ncols_y <= 4 ? 4 : 2);     // A4000
+    
+    const int rows_per_cuda_block = (cc >= 89) ? (ncols_y == 1 ? 2 : 4) :  // RTX 4090
+                                                (ncols_y == 1 ? 1 : 2);     // A4000
 
     const int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
     const int row0 = rows_per_cuda_block*blockIdx.x;
@@ -69,7 +76,7 @@ static __global__ void mul_mat_vec_q(
     const int blocks_per_col_y = nrows_y / QK8_1;
     constexpr int blocks_per_iter = vdr * nwarps*WARP_SIZE / qi;
 
-    // Use shared memory more effectively
+    // Use shared memory more effectively based on L1 cache size
     __shared__ float tmp_shared[nwarps][ncols_y][rows_per_cuda_block][WARP_SIZE];
     
     // Local accumulation buffer

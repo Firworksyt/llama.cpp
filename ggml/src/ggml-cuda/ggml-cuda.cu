@@ -1275,59 +1275,40 @@ static void ggml_cuda_op_mul_mat_cublas(
 static void ggml_cuda_set_peer_access(const int n_tokens, int main_device) {
     static bool peer_access_enabled = false;
 
-    const bool enable_peer_access = n_tokens <= GGML_CUDA_PEER_MAX_BATCH_SIZE;
-
-    if (peer_access_enabled == enable_peer_access) {
-        return;
-    }
-
-#ifdef NDEBUG
-    for (int id = 0; id < ggml_backend_cuda_get_device_count(); ++id) {
-        ggml_cuda_set_device(id);
-        CUDA_CHECK(cudaDeviceSynchronize());
-    }
-
-    for (int id = 0; id < ggml_backend_cuda_get_device_count(); ++id) {
-        ggml_cuda_set_device(id);
-
-        for (int id_other = 0; id_other < ggml_backend_cuda_get_device_count(); ++id_other) {
-            if (id == id_other) {
-                continue;
+    if (!peer_access_enabled) {
+        // Enable peer access for multi-GPU setup
+        int device_count;
+        CUDA_CHECK(cudaGetDeviceCount(&device_count));
+        
+        // Custom split ratio for RTX 4090 (device 0) and A4000 (device 1)
+        // 4090 gets ~60% of the workload due to higher compute capability
+        if (device_count == 2) {
+            cudaDeviceProp prop0, prop1;
+            CUDA_CHECK(cudaGetDeviceProperties(&prop0, 0));
+            CUDA_CHECK(cudaGetDeviceProperties(&prop1, 1));
+            
+            // Adjust split ratio based on GPU compute capabilities
+            if (prop0.multiProcessorCount > prop1.multiProcessorCount) {
+                // RTX 4090 has more SMs, give it more work
+                g_tensor_split[0] = 0.6f;  // 60% to RTX 4090
+                g_tensor_split[1] = 0.4f;  // 40% to A4000
             }
-            if (id != main_device && id_other != main_device) {
-                continue;
-            }
-
-            int can_access_peer;
-            CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access_peer, id, id_other));
-            if (can_access_peer) {
-                if (enable_peer_access) {
-                    cudaError_t err = cudaDeviceEnablePeerAccess(id_other, 0);
-                    if (err != cudaErrorPeerAccessAlreadyEnabled) {
-                        CUDA_CHECK(err);
-                    } else {
-                        // reset the error
-                        (void)cudaGetLastError();
-                    }
-                } else {
-                    cudaError_t err = cudaDeviceDisablePeerAccess(id_other);
-                    if (err != cudaErrorPeerAccessNotEnabled) {
-                        CUDA_CHECK(err);
-                    } else {
-                        // reset the error
-                        (void)cudaGetLastError();
+        }
+        
+        for (int i = 0; i < device_count; ++i) {
+            for (int j = 0; j < device_count; ++j) {
+                if (i != j) {
+                    int can_access_peer;
+                    CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access_peer, i, j));
+                    if (can_access_peer) {
+                        CUDA_CHECK(cudaSetDevice(i));
+                        CUDA_CHECK(cudaDeviceEnablePeerAccess(j, 0));
                     }
                 }
             }
         }
+        peer_access_enabled = true;
     }
-
-    ggml_cuda_set_device(main_device);
-#endif // NDEBUG
-
-    peer_access_enabled = enable_peer_access;
-
-    GGML_UNUSED(main_device);
 }
 
 static cudaError_t ggml_cuda_Memcpy2DPeerAsync(
@@ -1374,8 +1355,8 @@ static void ggml_cuda_op_mul_mat(
 
     GGML_ASSERT(ggml_backend_buffer_is_cuda(dst->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_cuda(src1->buffer));
-    ggml_backend_cuda_buffer_context * src1_ctx = (ggml_backend_cuda_buffer_context *) src1->buffer->context;
-    ggml_backend_cuda_buffer_context * dst_ctx  = (ggml_backend_cuda_buffer_context *) dst->buffer->context;
+    ggml_backend_cuda_buffer_context * src1_ctx = (ggml_backend_cuda_buffer_context *)src1->buffer->context;
+    ggml_backend_cuda_buffer_context * dst_ctx  = (ggml_backend_cuda_buffer_context *)dst->buffer->context;
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32 || (src1->ne[2] == 1 && src1->ne[3] == 1));
 
@@ -1861,6 +1842,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             }
 
             const int cc              = ggml_cuda_info().devices[id].cc;
+
             use_mul_mat_q             = use_mul_mat_q             && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1]);
             any_gpus_with_slow_fp16   = any_gpus_with_slow_fp16   || !fast_fp16_hardware_available(cc);
             any_gpus_without_fp16_mma = any_gpus_without_fp16_mma || !fp16_mma_hardware_available(cc);
@@ -1908,7 +1890,7 @@ static __global__ void k_copy_src1_to_contiguous(const char * __restrict__ src1_
                                                  int * __restrict__ cur_src1_row, mmid_row_mapping * __restrict__ row_mapping,
                                                  const char * __restrict ids, int64_t i02, size_t ids_nb1, size_t ids_nb0,
                                                  int64_t ne11, int64_t ne10,
-                                                 size_t nb11, size_t nb12) {
+                                                 size_t  nb11, size_t  nb12) {
     int32_t iid1 = blockIdx.x;
     int32_t id = blockIdx.y;
 
