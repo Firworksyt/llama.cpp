@@ -59,9 +59,9 @@ static __global__ void mul_mat_vec_q(
     // Get the correct vector dot product function for our quantization type
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
-    // Optimize for RTX 4090 - increase warps while maintaining correctness
-    constexpr int nwarps = ncols_y <= 4 ? 8 : 4;  // Doubled from original
-    constexpr int rows_per_cuda_block = ncols_y == 1 ? 2 : 4;  // Increased for better occupancy
+    // Original configuration - not optimized for specific GPU
+    constexpr int nwarps = ncols_y <= 4 ? 4 : 2;
+    constexpr int rows_per_cuda_block = ncols_y == 1 ? 1 : 2;
 
     const int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
     const int row0 = rows_per_cuda_block*blockIdx.x;
