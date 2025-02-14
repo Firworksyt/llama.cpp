@@ -59,28 +59,27 @@ static __global__ void mul_mat_vec_q(
     // Get the correct vector dot product function for our quantization type
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
-    // Optimize based on device compute capability
-    const int device_id = ggml_cuda_get_device();
-    const int cc = ggml_cuda_info().devices[device_id].cc;
-    
-    // RTX 4090 (Ada Lovelace) has cc 8.9, A4000 (Ampere) has cc 8.6
-    const int nwarps = (cc >= 89) ? (ncols_y <= 4 ? 8 : 4) :  // RTX 4090
-                                   (ncols_y <= 4 ? 4 : 2);     // A4000
-    
-    const int rows_per_cuda_block = (cc >= 89) ? (ncols_y == 1 ? 2 : 4) :  // RTX 4090
-                                                (ncols_y == 1 ? 1 : 2);     // A4000
+    // Use template parameters for compile-time constants
+    #if __CUDA_ARCH__ >= 890  // RTX 4090
+        constexpr int nwarps = ncols_y <= 4 ? 8 : 4;
+        constexpr int rows_per_block = ncols_y == 1 ? 2 : 4;
+    #else  // A4000 and others
+        constexpr int nwarps = ncols_y <= 4 ? 4 : 2;
+        constexpr int rows_per_block = ncols_y == 1 ? 1 : 2;
+    #endif
+
+    constexpr int blocks_per_iter = vdr * nwarps * WARP_SIZE / qi;
 
     const int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
-    const int row0 = rows_per_cuda_block*blockIdx.x;
+    const int row0 = rows_per_block*blockIdx.x;
     const int blocks_per_row_x = ncols_x / qk;
     const int blocks_per_col_y = nrows_y / QK8_1;
-    constexpr int blocks_per_iter = vdr * nwarps*WARP_SIZE / qi;
 
-    // Use shared memory more effectively based on L1 cache size
-    __shared__ float tmp_shared[nwarps][ncols_y][rows_per_cuda_block][WARP_SIZE];
+    // Static allocation for shared memory
+    __shared__ float tmp_shared[32][8][4][32];  // Max possible sizes
     
-    // Local accumulation buffer
-    float tmp[ncols_y][rows_per_cuda_block] = {0.0f};
+    // Local accumulation buffer with fixed size
+    float tmp[8][4] = {0.0f};  // Max possible sizes
 
     const block_q8_1 * y = (const block_q8_1 *) vy;
 
@@ -95,7 +94,7 @@ static __global__ void mul_mat_vec_q(
         #pragma unroll
         for (int j = 0; j < ncols_y; ++j) {
             #pragma unroll
-            for (int i = 0; i < rows_per_cuda_block; ++i) {
+            for (int i = 0; i < rows_per_block; ++i) {
                 tmp[j][i] += vec_dot_q_cuda(vx, &y[j*blocks_per_col_y + kby], 
                     (row0 + i)*blocks_per_row_x + kbx, kqs);
             }
@@ -107,7 +106,7 @@ static __global__ void mul_mat_vec_q(
         #pragma unroll
         for (int j = 0; j < ncols_y; ++j) {
             #pragma unroll
-            for (int i = 0; i < rows_per_cuda_block; ++i) {
+            for (int i = 0; i < rows_per_block; ++i) {
                 tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
             }
         }
@@ -122,7 +121,7 @@ static __global__ void mul_mat_vec_q(
     #pragma unroll
     for (int j = 0; j < ncols_y; ++j) {
         #pragma unroll
-        for (int i = 0; i < rows_per_cuda_block; ++i) {
+        for (int i = 0; i < rows_per_block; ++i) {
             #pragma unroll
             for (int l = 0; l < nwarps-1; ++l) {
                 tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
@@ -130,7 +129,7 @@ static __global__ void mul_mat_vec_q(
             tmp[j][i] = warp_reduce_sum(tmp[j][i]);
         }
 
-        if (threadIdx.x < rows_per_cuda_block && (rows_per_cuda_block == 1 || row0 + threadIdx.x < nrows_dst)) {
+        if (threadIdx.x < rows_per_block && (rows_per_block == 1 || row0 + threadIdx.x < nrows_dst)) {
             dst[j*nrows_dst + row0 + threadIdx.x] = tmp[j][threadIdx.x];
         }
     }
