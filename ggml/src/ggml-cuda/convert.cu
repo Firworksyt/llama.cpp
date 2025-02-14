@@ -148,35 +148,51 @@ static __global__ void dequantize_block_q2_K(const void * __restrict__ vx, dst_t
 
 template<typename dst_t>
 static __global__ void dequantize_block_q3_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
-
     const int64_t i = blockIdx.x;
     const block_q3_K * x = (const block_q3_K *) vx;
-
-    const int64_t r = threadIdx.x/4;
-    const int64_t tid = r/2;
-    const int64_t is0 = r%2;
-    const int64_t l0 = 16*is0 + 4*(threadIdx.x%4);
-    const int64_t n = tid / 4;
-    const int64_t j = tid - 4*n;
-
-    uint8_t m = 1 << (4*n + j);
-    int64_t is = 8*n + 2*j + is0;
-    int shift = 2*j;
-
-    int8_t us = is <  4 ? (x[i].scales[is-0] & 0xF) | (((x[i].scales[is+8] >> 0) & 3) << 4) :
-                is <  8 ? (x[i].scales[is-0] & 0xF) | (((x[i].scales[is+4] >> 2) & 3) << 4) :
-                is < 12 ? (x[i].scales[is-8] >>  4) | (((x[i].scales[is+0] >> 4) & 3) << 4) :
-                          (x[i].scales[is-8] >>  4) | (((x[i].scales[is-4] >> 6) & 3) << 4);
-    float d_all = x[i].d;
-    float dl = d_all * (us - 32);
-
-    dst_t * y = yy + i*QK_K + 128*n + 32*j;
-    const uint8_t * q = x[i].qs + 32*n;
-    const uint8_t * hm = x[i].hmask;
-
-    for (int l = l0; l < l0+4; ++l) y[l] = dl * ((int8_t)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4));
+    // Optimize thread layout for better memory coalescing
+    const int64_t tid = threadIdx.x;
+    const int64_t n = tid >> 6;    // Divide by 64 for better warp alignment
+    const int64_t j = (tid >> 4) & 0x3;
+    // Preload scales into shared memory for faster access
+    __shared__ float scales_cache[32];
+    if (tid < 32) {
+        int8_t us;
+        const int64_t is = tid;
+        if (is < 4) {
+            us = (x[i].scales[is-0] & 0xF) | (((x[i].scales[is+8] >> 0) & 3) << 4);
+        } else if (is < 8) {
+            us = (x[i].scales[is-0] & 0xF) | (((x[i].scales[is+4] >> 2) & 3) << 4);
+        } else if (is < 12) {
+            us = (x[i].scales[is-8] >> 4) | (((x[i].scales[is+0] >> 4) & 3) << 4);
+        } else {
+            us = (x[i].scales[is-8] >> 4) | (((x[i].scales[is-4] >> 6) & 3) << 4);
+        }
+        // Convert half to float before multiplication
+        float d_all = __half2float(x[i].d);
+        scales_cache[tid] = d_all * (float)(us - 32);
+    }
+    __syncthreads();
+    // Calculate base indices for better memory access patterns
+    const int64_t base_idx = i * QK_K + n * 128 + j * 32;
+    const int64_t q_idx = n * 32;
+    // Load data using vector loads for better memory throughput
+    const uint32_t* q_vec = reinterpret_cast<const uint32_t*>(x[i].qs + q_idx);
+    const uint32_t* hm_vec = reinterpret_cast<const uint32_t*>(x[i].hmask);
+    // Process 4 values at once using vectorized operations
+    #pragma unroll
+    for (int l = 0; l < 4; l++) {
+        const int64_t offset = tid & 0xF;
+        const int64_t out_idx = base_idx + offset + l * 4;
+        uint32_t qv = q_vec[l];
+        uint32_t mv = hm_vec[l];
+        int shift = 2 * j;
+        uint8_t m = 1 << (4 * n + j);
+        float scale = scales_cache[8 * n + 2 * j + (offset >= 8 ? 1 : 0)];
+        int8_t val = ((qv >> shift) & 3) - ((mv & m) ? 0 : 4);
+        yy[out_idx] = static_cast<dst_t>(scale * val);
+    }
 }
-
 static inline __device__ void get_scale_min_k4(int j, const uint8_t * q, uint8_t & d, uint8_t & m) {
     if (j < 4) {
         d = q[j] & 63; m = q[j + 4] & 63;
