@@ -41,8 +41,8 @@ static __global__ void dequantize_block_q8_0_f16(const void * __restrict__ vx, h
             break;
         }
 
-        // Restore prefetching for better memory access patterns
-        __builtin_prefetch(((const char *)x0) + (ix0 + threadIdx.x + WARP_SIZE)*sizeof(int), 0, 0);
+        // Use CUDA's native prefetch intrinsic
+        __prefetch_global_l1(x0 + ix0 + threadIdx.x + WARP_SIZE);
         const int ix = ix0 + threadIdx.x;
         vals[ix] = x0[ix];
     }
